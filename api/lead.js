@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 const PRODUCTION_KANOO_ENDPOINT = "https://pro360api.kanooerp.com/api/zapier/tiktok";
 const PRODUCTION_KANOO_HOST = new URL(PRODUCTION_KANOO_ENDPOINT).hostname;
@@ -22,8 +22,9 @@ const FIELD_ALIASES = {
 // payload is untouched.
 const CONTACT_US_FIELDS = ["preferred_city", "looking_for"];
 
-// Set ALLOWED_ORIGINS to a comma-separated list of Framer domains to lock this down.
-// Unset means any origin may post a lead.
+// ALLOWED_ORIGINS is a comma-separated list of browser origins; unset means any origin.
+// Origin is only a browser hint and is never used to authenticate Framer's webhook:
+// once FRAMER_WEBHOOK_SECRET is set, POSTs are checked by signature instead.
 function resolveOrigin(requestOrigin) {
   const configured = (process.env.ALLOWED_ORIGINS || "")
     .split(",")
@@ -64,6 +65,29 @@ function resolveKanooEndpoint() {
   const host = url.hostname.replace(/\.$/, "");
   if (!["https:", "http:"].includes(url.protocol) || host === PRODUCTION_KANOO_HOST) return null;
   return url.href;
+}
+
+// Vercel's Node helpers buffer the body for req.body and replay the raw bytes to
+// "data"/"end" listeners, so the exact signed bytes can still be read here.
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+// Framer signs every webhook when its destination has a secret: Framer-Signature is
+// "sha256=" + hex HMAC-SHA256 over the raw body followed by Framer-Webhook-Submission-Id.
+function isFramerSignatureValid(secret, rawBody, signature, submissionId) {
+  if (typeof signature !== "string" || typeof submissionId !== "string" || !submissionId) return false;
+
+  const expected = Buffer.from(
+    "sha256=" + createHmac("sha256", secret).update(rawBody).update(submissionId).digest("hex"),
+  );
+  const received = Buffer.from(signature);
+  return received.length === expected.length && timingSafeEqual(received, expected);
 }
 
 function parseBody(body) {
@@ -115,7 +139,20 @@ export default async function handler(req, res) {
 
   const send = (status, body) => res.status(status).json({ ...body, requestId });
 
-  if (!applyCors(req, res)) {
+  const webhookSecret = process.env.FRAMER_WEBHOOK_SECRET;
+  let rawBody = null;
+  if (webhookSecret && req.method === "POST") {
+    rawBody = await readRawBody(req);
+    const signature = req.headers["framer-signature"];
+    const submissionId = req.headers["framer-webhook-submission-id"];
+    if (!isFramerSignatureValid(webhookSecret, rawBody, signature, submissionId)) {
+      log("error", requestId, "signature_rejected", {
+        hasSignature: Boolean(signature),
+        hasSubmissionId: Boolean(submissionId),
+      });
+      return send(401, { success: false, message: "Invalid signature" });
+    }
+  } else if (!applyCors(req, res)) {
     log("error", requestId, "origin_rejected", { origin: req.headers.origin });
     return send(403, { success: false, message: "Origin not allowed" });
   }
@@ -147,7 +184,7 @@ export default async function handler(req, res) {
     return send(500, { success: false, message: "Server configuration error" });
   }
 
-  const body = parseBody(req.body);
+  const body = parseBody(rawBody === null ? req.body : rawBody.toString("utf8"));
   if (!body) {
     log("error", requestId, "validation_failed", { reason: "missing or invalid JSON body" });
     return send(400, { success: false, message: "Validation error" });
@@ -187,14 +224,11 @@ export default async function handler(req, res) {
       .join(" | ");
   }
 
+  // Logs never carry submitted values: only which form and fields arrived.
   log("info", requestId, "lead_received", {
-    payload: {
-      name: payload.name,
-      phone_number: payload.phone_number,
-      email: payload.email,
-      campaign_name: payload.campaign_name,
-      lead_source: payload.lead_source,
-    },
+    form_name: payload.form_name ?? null,
+    lead_source: payload.lead_source,
+    receivedFields: Object.keys(body),
   });
 
   const startedAt = Date.now();
@@ -223,7 +257,8 @@ export default async function handler(req, res) {
     log("error", requestId, "kanoo_unreachable", {
       durationMs: Date.now() - startedAt,
       timedOut,
-      error: error.message,
+      category: timedOut ? "timeout" : "network_error",
+      errorCode: error.cause?.code ?? error.name,
     });
     return send(timedOut ? 504 : 502, {
       success: false,
@@ -236,7 +271,11 @@ export default async function handler(req, res) {
     log("error", requestId, "kanoo_failure", {
       status: kanooResponse.status,
       durationMs: Date.now() - startedAt,
-      response: kanooBody,
+      category: kanooResponse.status >= 500 ? "upstream_server_error" : "upstream_rejected",
+      responseKeys:
+        kanooBody && typeof kanooBody === "object" && !Array.isArray(kanooBody)
+          ? Object.keys(kanooBody)
+          : undefined,
     });
     return send(kanooResponse.status, {
       success: false,

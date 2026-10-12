@@ -1,12 +1,22 @@
 import { after, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
+import { Readable } from "node:stream";
 import handler from "../api/lead.js";
 
 // fetch is replaced before any test runs, so nothing here can reach the real Kanoo API.
 const KANOO_URL = "https://pro360api.kanooerp.com/api/zapier/tiktok";
-const ENV_KEYS = ["KANOO_TOKEN", "KANOO_DB", "ALLOWED_ORIGINS", "VERCEL_ENV", "KANOO_ENDPOINT"];
+const ENV_KEYS = [
+  "KANOO_TOKEN",
+  "KANOO_DB",
+  "ALLOWED_ORIGINS",
+  "VERCEL_ENV",
+  "KANOO_ENDPOINT",
+  "FRAMER_WEBHOOK_SECRET",
+];
 
 let kanooCalls;
+let kanooReply;
 let logged;
 const saved = {};
 
@@ -18,16 +28,10 @@ before(() => {
 
   globalThis.fetch = async (url, init) => {
     kanooCalls.push({ url, init });
-    return new Response(JSON.stringify({ status: "ok" }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
+    return kanooReply();
   };
   console.log = (line) => logged.push(line);
   console.error = (line) => logged.push(line);
-  process.env.KANOO_TOKEN = "test-token";
-  process.env.KANOO_DB = "test-db";
-  delete process.env.ALLOWED_ORIGINS;
 });
 
 after(() => {
@@ -42,13 +46,22 @@ after(() => {
 
 beforeEach(() => {
   kanooCalls = [];
+  kanooReply = async () =>
+    new Response(JSON.stringify({ status: "ok" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
   logged = [];
+  process.env.KANOO_TOKEN = "test-token";
+  process.env.KANOO_DB = "test-db";
+  delete process.env.ALLOWED_ORIGINS;
   delete process.env.VERCEL_ENV;
   delete process.env.KANOO_ENDPOINT;
+  delete process.env.FRAMER_WEBHOOK_SECRET;
 });
 
-async function submit(body) {
-  const res = {
+function makeResponse() {
+  return {
     statusCode: undefined,
     body: undefined,
     headers: {},
@@ -67,8 +80,43 @@ async function submit(body) {
       return this;
     },
   };
+}
+
+async function submit(body) {
+  const res = makeResponse();
   await handler({ method: "POST", headers: {}, body }, res);
   return res;
+}
+
+// Mirrors Vercel's Node helpers: req.body is pre-parsed and the raw bytes are replayed on the stream.
+async function deliver({ method = "POST", headers = {}, raw = "", body }) {
+  const req = Readable.from(raw ? [Buffer.from(raw)] : []);
+  let parsed = body;
+  if (parsed === undefined && raw) {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = undefined;
+    }
+  }
+  Object.assign(req, { method, headers, body: parsed });
+  const res = makeResponse();
+  await handler(req, res);
+  return res;
+}
+
+const WEBHOOK_SECRET = "test-webhook-secret-0123456789abcdef";
+
+// Framer's documented scheme: "sha256=" + hex HMAC-SHA256 over the raw body, then the submission ID.
+function framerSignature(raw, submissionId, secret = WEBHOOK_SECRET) {
+  return "sha256=" + createHmac("sha256", secret).update(raw).update(submissionId).digest("hex");
+}
+
+function signedHeaders(raw, submissionId = "sub_test_0001") {
+  return {
+    "framer-signature": framerSignature(raw, submissionId),
+    "framer-webhook-submission-id": submissionId,
+  };
 }
 
 function sentPayload() {
@@ -361,5 +409,346 @@ describe("Kanoo endpoint selection", () => {
     for (const value of ["test-token", "test-db", "Test Person", "test@example.com", "+966500000000"]) {
       assert.ok(!output.includes(value), `log contains ${value}`);
     }
+  });
+});
+
+describe("Origin handling without FRAMER_WEBHOOK_SECRET (unchanged behaviour)", () => {
+  const JEWAR = "https://www.jewarsa.com";
+
+  test("OPTIONS with an allowed Origin returns 204 and echoes that origin", async () => {
+    process.env.ALLOWED_ORIGINS = JEWAR;
+
+    const res = await deliver({ method: "OPTIONS", headers: { origin: JEWAR } });
+
+    assert.equal(res.statusCode, 204);
+    assert.equal(res.headers["Access-Control-Allow-Origin"], JEWAR);
+    assert.equal(res.headers.Vary, "Origin");
+  });
+
+  test("OPTIONS without Origin is rejected when ALLOWED_ORIGINS is set", async () => {
+    process.env.ALLOWED_ORIGINS = JEWAR;
+
+    const res = await deliver({ method: "OPTIONS" });
+
+    assert.equal(res.statusCode, 403);
+    assert.equal(res.body.message, "Origin not allowed");
+  });
+
+  test("OPTIONS is open to any origin when ALLOWED_ORIGINS is unset", async () => {
+    const res = await deliver({ method: "OPTIONS" });
+
+    assert.equal(res.statusCode, 204);
+    assert.equal(res.headers["Access-Control-Allow-Origin"], "*");
+  });
+
+  test("POST with an allowed Origin sends the unchanged Register payload", async () => {
+    process.env.ALLOWED_ORIGINS = JEWAR;
+
+    const res = await deliver({ headers: { origin: JEWAR }, body: REGISTER_YOUR_INTEREST });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(kanooCalls[0].init.body, REGISTER_WIRE_BODY);
+  });
+
+  test("POST without Origin is rejected before Kanoo when ALLOWED_ORIGINS is set", async () => {
+    process.env.ALLOWED_ORIGINS = JEWAR;
+
+    const res = await deliver({ body: REGISTER_YOUR_INTEREST });
+
+    assert.equal(res.statusCode, 403);
+    assert.equal(kanooCalls.length, 0);
+  });
+
+  for (const origin of ["https://jewarsa.com", "http://www.jewarsa.com", `${JEWAR}/`, "https://evil.example"]) {
+    test(`POST from ${origin} is rejected before Kanoo`, async () => {
+      process.env.ALLOWED_ORIGINS = JEWAR;
+
+      const res = await deliver({ headers: { origin }, body: REGISTER_YOUR_INTEREST });
+
+      assert.equal(res.statusCode, 403);
+      assert.equal(kanooCalls.length, 0);
+    });
+  }
+});
+
+describe("Framer webhook signature (FRAMER_WEBHOOK_SECRET set)", () => {
+  const JEWAR = "https://www.jewarsa.com";
+  const REGISTER_RAW = JSON.stringify(REGISTER_YOUR_INTEREST);
+  const CONTACT_US_RAW = JSON.stringify(CONTACT_US);
+
+  beforeEach(() => {
+    process.env.FRAMER_WEBHOOK_SECRET = WEBHOOK_SECRET;
+    process.env.ALLOWED_ORIGINS = JEWAR;
+  });
+
+  test("accepts Framer's documented HMAC (known-answer vector computed with openssl)", async () => {
+    const res = await deliver({
+      raw: REGISTER_RAW,
+      headers: {
+        "framer-signature": "sha256=c55658033c539f47146de70f814b9d0a0d6d1321d2415aea873e8fb9cd472c59",
+        "framer-webhook-submission-id": "sub_test_0001",
+      },
+    });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(kanooCalls[0].init.body, REGISTER_WIRE_BODY);
+  });
+
+  test("accepts a signed Register submission without an Origin header", async () => {
+    const res = await deliver({ raw: REGISTER_RAW, headers: signedHeaders(REGISTER_RAW) });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(kanooCalls[0].url, KANOO_URL);
+    assert.equal(kanooCalls[0].init.body, REGISTER_WIRE_BODY);
+  });
+
+  test("accepts a signed request that also carries an Origin header", async () => {
+    const res = await deliver({
+      raw: REGISTER_RAW,
+      headers: { ...signedHeaders(REGISTER_RAW), origin: "https://anything.example" },
+    });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(kanooCalls[0].init.body, REGISTER_WIRE_BODY);
+  });
+
+  test("maps a signed Contact Us submission", async () => {
+    const res = await deliver({ raw: CONTACT_US_RAW, headers: signedHeaders(CONTACT_US_RAW) });
+
+    assert.equal(res.statusCode, 200);
+    const payload = sentPayload();
+    assert.equal(payload.phone_number, "+966500000000");
+    assert.equal(payload.form_name, "Contact Us");
+    assert.equal(payload.q_1, "Preferred City: Riyadh");
+    assert.equal(payload.q_2, "Looking For: Buy | Property Type: Residential");
+  });
+
+  test("forwards the verified raw body, not a separately parsed req.body", async () => {
+    const res = await deliver({
+      raw: REGISTER_RAW,
+      headers: signedHeaders(REGISTER_RAW),
+      body: { Name: "Someone Else", phone_number: "+966511111111" },
+    });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(kanooCalls[0].init.body, REGISTER_WIRE_BODY);
+  });
+
+  const valid = signedHeaders(REGISTER_RAW);
+  const rejected = [
+    ["no signature headers", REGISTER_RAW, {}],
+    ["Framer-Signature missing", REGISTER_RAW, { "framer-webhook-submission-id": "sub_test_0001" }],
+    ["submission ID missing", REGISTER_RAW, { "framer-signature": valid["framer-signature"] }],
+    [
+      "an empty submission ID",
+      REGISTER_RAW,
+      {
+        "framer-signature": framerSignature(REGISTER_RAW, ""),
+        "framer-webhook-submission-id": "",
+      },
+    ],
+    [
+      "a different secret",
+      REGISTER_RAW,
+      {
+        "framer-signature": framerSignature(REGISTER_RAW, "sub_test_0001", "another-secret-0123456789abcdefgh"),
+        "framer-webhook-submission-id": "sub_test_0001",
+      },
+    ],
+    ["a body changed after signing", REGISTER_RAW.replace("Test Person", "Mallory"), valid],
+    ["a submission ID changed after signing", REGISTER_RAW, { ...valid, "framer-webhook-submission-id": "sub_test_0002" }],
+    [
+      "a signature over the body only",
+      REGISTER_RAW,
+      {
+        "framer-signature": "sha256=" + createHmac("sha256", WEBHOOK_SECRET).update(REGISTER_RAW).digest("hex"),
+        "framer-webhook-submission-id": "sub_test_0001",
+      },
+    ],
+    ["no sha256= prefix", REGISTER_RAW, { ...valid, "framer-signature": valid["framer-signature"].slice(7) }],
+    ["a truncated signature", REGISTER_RAW, { ...valid, "framer-signature": valid["framer-signature"].slice(0, 70) }],
+    ["non-ASCII characters", REGISTER_RAW, { ...valid, "framer-signature": "sha256=" + "é".repeat(64) }],
+  ];
+
+  for (const [label, raw, headers] of rejected) {
+    test(`rejects ${label} with 401 before Kanoo`, async () => {
+      const res = await deliver({ raw, headers });
+
+      assert.equal(res.statusCode, 401);
+      assert.equal(res.body.message, "Invalid signature");
+      assert.equal(kanooCalls.length, 0);
+    });
+  }
+
+  test("rejects an unsigned POST even from an allowed Origin", async () => {
+    const res = await deliver({ raw: REGISTER_RAW, headers: { origin: JEWAR } });
+
+    assert.equal(res.statusCode, 401);
+    assert.equal(kanooCalls.length, 0);
+  });
+
+  test("leaves OPTIONS governed by ALLOWED_ORIGINS", async () => {
+    const allowed = await deliver({ method: "OPTIONS", headers: { origin: JEWAR } });
+    const missing = await deliver({ method: "OPTIONS" });
+
+    assert.equal(allowed.statusCode, 204);
+    assert.equal(missing.statusCode, 403);
+  });
+
+  for (const [label, raw] of [
+    ["an empty JSON object", "{}"],
+    ["invalid JSON", "{not json"],
+    ["an empty body", ""],
+  ]) {
+    test(`rejects a correctly signed request with ${label} before Kanoo`, async () => {
+      const res = await deliver({ raw, headers: signedHeaders(raw) });
+
+      assert.equal(res.statusCode, 400);
+      assert.equal(kanooCalls.length, 0);
+    });
+  }
+
+  test("logs a signature rejection without the secret, signature or submitter details", async () => {
+    await deliver({ raw: REGISTER_RAW, headers: { ...valid, "framer-webhook-submission-id": "sub_tampered" } });
+
+    const output = JSON.stringify(logged);
+    assert.match(output, /signature_rejected/);
+    for (const value of [WEBHOOK_SECRET, valid["framer-signature"], "Test Person", "test@example.com", "+966500000000"]) {
+      assert.ok(!output.includes(value), `log contains ${value}`);
+    }
+  });
+});
+
+describe("Configuration and payload errors", () => {
+  for (const key of ["KANOO_TOKEN", "KANOO_DB"]) {
+    test(`returns 500 without calling Kanoo when ${key} is missing`, async () => {
+      delete process.env[key];
+
+      const res = await submit(REGISTER_YOUR_INTEREST);
+
+      assert.equal(res.statusCode, 500);
+      assert.equal(res.body.message, "Server configuration error");
+      assert.equal(kanooCalls.length, 0);
+    });
+  }
+
+  test("returns 500 for a correctly signed request when credentials are missing", async () => {
+    process.env.FRAMER_WEBHOOK_SECRET = WEBHOOK_SECRET;
+    delete process.env.KANOO_TOKEN;
+    const raw = JSON.stringify(REGISTER_YOUR_INTEREST);
+
+    const res = await deliver({ raw, headers: signedHeaders(raw) });
+
+    assert.equal(res.statusCode, 500);
+    assert.equal(kanooCalls.length, 0);
+  });
+
+  test("rejects a body that is not JSON without calling Kanoo", async () => {
+    const res = await submit("{not json");
+
+    assert.equal(res.statusCode, 400);
+    assert.equal(kanooCalls.length, 0);
+  });
+});
+
+describe("Log privacy", () => {
+  const SENSITIVE = [
+    "Test Person",
+    "test@example.com",
+    "+966500000000",
+    "Riyadh",
+    "Residential",
+    "test-token",
+    "test-db",
+    "KANOO_DETAIL_MARKER",
+  ];
+
+  function assertLogsAreClean() {
+    const output = JSON.stringify(logged);
+    for (const value of SENSITIVE) {
+      assert.ok(!output.includes(value), `log contains ${value}`);
+    }
+  }
+
+  function logEntry(event) {
+    const entry = logged.find((line) => line.event === event);
+    assert.ok(entry, `no ${event} log entry`);
+    return entry;
+  }
+
+  test("lead_received records the form and field names, not the lead's details", async () => {
+    await submit(CONTACT_US);
+
+    const entry = logEntry("lead_received");
+    assert.equal(entry.form_name, "Contact Us");
+    assert.deepEqual(entry.receivedFields, Object.keys(CONTACT_US));
+    assertLogsAreClean();
+  });
+
+  test("lead_received for Register Your Interest carries no personal data", async () => {
+    await submit(REGISTER_YOUR_INTEREST);
+
+    assert.equal(logEntry("lead_received").form_name, null);
+    assertLogsAreClean();
+  });
+
+  test("kanoo_failure records status and category, never Kanoo's response body", async () => {
+    kanooReply = async () =>
+      new Response(JSON.stringify({ message: "KANOO_DETAIL_MARKER", echo: CONTACT_US }), { status: 422 });
+
+    await submit(CONTACT_US);
+
+    const entry = logEntry("kanoo_failure");
+    assert.equal(entry.status, 422);
+    assert.equal(entry.category, "upstream_rejected");
+    assert.deepEqual(entry.responseKeys, ["message", "echo"]);
+    assertLogsAreClean();
+  });
+
+  test("kanoo_failure categorises an upstream server error with a non-JSON body", async () => {
+    kanooReply = async () => new Response("KANOO_DETAIL_MARKER for +966500000000", { status: 503 });
+
+    await submit(REGISTER_YOUR_INTEREST);
+
+    const entry = logEntry("kanoo_failure");
+    assert.equal(entry.status, 503);
+    assert.equal(entry.category, "upstream_server_error");
+    assert.equal(entry.responseKeys, undefined);
+    assertLogsAreClean();
+  });
+
+  test("kanoo_unreachable records a category and error code, never the raw error message", async () => {
+    kanooReply = async () => {
+      throw Object.assign(new TypeError("KANOO_DETAIL_MARKER Test Person +966500000000"), {
+        cause: { code: "ECONNRESET" },
+      });
+    };
+
+    await submit(REGISTER_YOUR_INTEREST);
+
+    const entry = logEntry("kanoo_unreachable");
+    assert.equal(entry.category, "network_error");
+    assert.equal(entry.errorCode, "ECONNRESET");
+    assertLogsAreClean();
+  });
+
+  test("kanoo_unreachable categorises a timeout", async () => {
+    kanooReply = async () => {
+      throw new DOMException("KANOO_DETAIL_MARKER", "TimeoutError");
+    };
+
+    await submit(REGISTER_YOUR_INTEREST);
+
+    const entry = logEntry("kanoo_unreachable");
+    assert.equal(entry.category, "timeout");
+    assert.equal(entry.timedOut, true);
+    assertLogsAreClean();
+  });
+
+  test("validation_failed lists field names only", async () => {
+    await submit({ ...CONTACT_US, Name: "" });
+
+    assert.deepEqual(logEntry("validation_failed").missing, ["name"]);
+    assertLogsAreClean();
   });
 });
