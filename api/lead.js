@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 
-const KANOO_ENDPOINT = "https://pro360api.kanooerp.com/api/zapier/tiktok";
+const PRODUCTION_KANOO_ENDPOINT = "https://pro360api.kanooerp.com/api/zapier/tiktok";
+const PRODUCTION_KANOO_HOST = new URL(PRODUCTION_KANOO_ENDPOINT).hostname;
+const NON_PRODUCTION_ENVS = ["preview", "development"];
 const KANOO_TIMEOUT_MS = 15000;
 
 // Framer sends field names exactly as they are labelled in the form, so accept
@@ -8,8 +10,17 @@ const KANOO_TIMEOUT_MS = 15000;
 const FIELD_ALIASES = {
   name: ["name", "Name"],
   email: ["email", "Email"],
-  phone_number: ["phone_number", "phone", "Phone", "Phone Number"],
+  phone_number: ["phone_number", "phone", "Phone", "Phone Number", "phone Number"],
+  preferred_city: ["preferred_city", "Preferred City"],
+  looking_for: ["looking_for", "Looking For"],
+  property_type: ["property_type", "Property Type", "Location"],
 };
+
+// Contact Us is recognised by its distinctive fields rather than a ?form= flag,
+// because Framer does not document query strings on webhook URLs. Location is too
+// generic to count on its own. Register Your Interest sends none of these, so its
+// payload is untouched.
+const CONTACT_US_FIELDS = ["preferred_city", "looking_for"];
 
 // Set ALLOWED_ORIGINS to a comma-separated list of Framer domains to lock this down.
 // Unset means any origin may post a lead.
@@ -37,6 +48,24 @@ function applyCors(req, res) {
   return true;
 }
 
+// Preview and Development must set KANOO_ENDPOINT to a non-production endpoint and
+// can never fall back to, or be pointed at, production Kanoo. Everywhere else the
+// production endpoint is used and KANOO_ENDPOINT is ignored, so a variable that was
+// accidentally scoped to Production cannot divert real leads.
+function resolveKanooEndpoint() {
+  if (!NON_PRODUCTION_ENVS.includes(process.env.VERCEL_ENV)) return PRODUCTION_KANOO_ENDPOINT;
+
+  let url;
+  try {
+    url = new URL((process.env.KANOO_ENDPOINT || "").trim());
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/\.$/, "");
+  if (!["https:", "http:"].includes(url.protocol) || host === PRODUCTION_KANOO_HOST) return null;
+  return url.href;
+}
+
 function parseBody(body) {
   if (typeof body === "string") {
     try {
@@ -59,6 +88,19 @@ function pick(body, field) {
     if (value) return value;
   }
   return "";
+}
+
+function isContactUs(body) {
+  return CONTACT_US_FIELDS.some((field) =>
+    FIELD_ALIASES[field].some((key) => Object.hasOwn(body, key)),
+  );
+}
+
+// Kanoo expects "{Question}: {Answer}". A select left on its placeholder submits
+// the question itself ("Looking For"), which counts as unanswered.
+function answer(question, value) {
+  if (!value || value.toLowerCase() === question.toLowerCase()) return "";
+  return `${question}: ${value}`;
 }
 
 function log(level, requestId, event, extra = {}) {
@@ -96,6 +138,15 @@ export default async function handler(req, res) {
     return send(500, { success: false, message: "Server configuration error" });
   }
 
+  const kanooEndpoint = resolveKanooEndpoint();
+  if (!kanooEndpoint) {
+    log("error", requestId, "config_error", {
+      message: "Preview and Development need KANOO_ENDPOINT set to a non-production endpoint",
+      environment: process.env.VERCEL_ENV,
+    });
+    return send(500, { success: false, message: "Server configuration error" });
+  }
+
   const body = parseBody(req.body);
   if (!body) {
     log("error", requestId, "validation_failed", { reason: "missing or invalid JSON body" });
@@ -125,6 +176,17 @@ export default async function handler(req, res) {
     marketing_tags: str(body.marketing_tags) || "Marketing Leads",
   };
 
+  if (isContactUs(body)) {
+    payload.form_name = "Contact Us";
+    payload.q_1 = answer("Preferred City", pick(body, "preferred_city"));
+    payload.q_2 = [
+      answer("Looking For", pick(body, "looking_for")),
+      answer("Property Type", pick(body, "property_type")),
+    ]
+      .filter(Boolean)
+      .join(" | ");
+  }
+
   log("info", requestId, "lead_received", {
     payload: {
       name: payload.name,
@@ -139,7 +201,7 @@ export default async function handler(req, res) {
   let kanooResponse;
   let kanooBody;
   try {
-    kanooResponse = await fetch(KANOO_ENDPOINT, {
+    kanooResponse = await fetch(kanooEndpoint, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
