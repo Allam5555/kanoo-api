@@ -5,7 +5,22 @@ import { Readable } from "node:stream";
 import handler from "../api/lead.js";
 
 // fetch is replaced before any test runs, so nothing here can reach the real Kanoo API.
-const KANOO_URL = "https://pro360api.kanooerp.com/api/zapier/tiktok";
+// Kanoo Lead Submission API specification: endpoint, headers and the 12 payload fields.
+const KANOO_URL = "https://pro360api.kanooerp.com/api/zapier/Tiktok";
+const KANOO_FIELDS = [
+  "name",
+  "email",
+  "phone_number",
+  "campaign_name",
+  "form_name",
+  "ad_name",
+  "adset_name",
+  "platform",
+  "lead_source",
+  "marketing_tags",
+  "q_1",
+  "q_2",
+];
 const ENV_KEYS = [
   "KANOO_TOKEN",
   "KANOO_DB",
@@ -143,18 +158,18 @@ const CONTACT_US = {
 // Hidden spam-trap inputs Framer renders into both forms.
 const FRAMER_HONEYPOTS = { website: "", company: "", message: "", comments: "" };
 
-// Captured from api/lead.js at commit bb38f2c, before Contact Us support existed.
+// The Register Your Interest form's submission as the official 12-field Kanoo payload.
 const REGISTER_WIRE_BODY =
   '{"name":"Test Person","email":"test@example.com","phone_number":"+966500000000",' +
-  '"campaign_name":"","adgroup_name":"","ad_name":"","housing_support_eligible":"",' +
-  '"is_saudi_citizen":"","lead_source":"Website","marketing_tags":"Marketing Leads"}';
+  '"campaign_name":"","form_name":"","ad_name":"","adset_name":"","platform":"",' +
+  '"lead_source":"Website","marketing_tags":"Marketing Leads","q_1":"","q_2":""}';
 
-describe("Register Your Interest (must match the pre-Contact-Us payload byte for byte)", () => {
+describe("Register Your Interest (official Kanoo payload)", () => {
   for (const [label, body] of [
     ["as published", REGISTER_YOUR_INTEREST],
     ["with Framer honeypot fields", { ...REGISTER_YOUR_INTEREST, ...FRAMER_HONEYPOTS }],
   ]) {
-    test(`sends the unchanged wire body (${label})`, async () => {
+    test(`sends the official wire body (${label})`, async () => {
       const res = await submit(body);
 
       assert.equal(res.statusCode, 200);
@@ -163,39 +178,53 @@ describe("Register Your Interest (must match the pre-Contact-Us payload byte for
     });
   }
 
-  test("posts to the same Kanoo URL with the same auth headers", async () => {
+  test("posts to the official Kanoo URL with the documented headers", async () => {
     await submit(REGISTER_YOUR_INTEREST);
 
     assert.equal(kanooCalls[0].url, KANOO_URL);
     assert.equal(kanooCalls[0].init.method, "POST");
     assert.deepEqual(kanooCalls[0].init.headers, {
-      Authorization: "Bearer test-token",
+      apikey: "test-token",
       db: "test-db",
       "Content-Type": "application/json",
     });
   });
 
-  test("passes canonical snake_case fields through unchanged", async () => {
+  test("passes the official fields through from identically named keys", async () => {
     await submit({
       name: "Test Person",
       email: "test@example.com",
       phone_number: "+966500000000",
       campaign_name: "Summer Campaign",
-      adgroup_name: "Riyadh",
+      form_name: "Landing Page",
       ad_name: "Video A",
-      housing_support_eligible: "yes",
-      is_saudi_citizen: "yes",
+      adset_name: "Riyadh",
+      platform: "Website",
       lead_source: "Instagram",
       marketing_tags: "VIP",
+      q_1: "Budget: 2M",
+      q_2: "Timeline: 2027",
     });
 
     assert.equal(
       kanooCalls[0].init.body,
       '{"name":"Test Person","email":"test@example.com","phone_number":"+966500000000",' +
-        '"campaign_name":"Summer Campaign","adgroup_name":"Riyadh","ad_name":"Video A",' +
-        '"housing_support_eligible":"yes","is_saudi_citizen":"yes","lead_source":"Instagram",' +
-        '"marketing_tags":"VIP"}',
+        '"campaign_name":"Summer Campaign","form_name":"Landing Page","ad_name":"Video A",' +
+        '"adset_name":"Riyadh","platform":"Website","lead_source":"Instagram",' +
+        '"marketing_tags":"VIP","q_1":"Budget: 2M","q_2":"Timeline: 2027"}',
     );
+  });
+
+  test("accepts the former adgroup_name key as adset_name", async () => {
+    await submit({ ...REGISTER_YOUR_INTEREST, adgroup_name: "Riyadh" });
+
+    assert.equal(sentPayload().adset_name, "Riyadh");
+  });
+
+  test("does not forward fields outside the Kanoo specification", async () => {
+    await submit({ ...REGISTER_YOUR_INTEREST, housing_support_eligible: "yes", is_saudi_citizen: "yes" });
+
+    assert.deepEqual(Object.keys(sentPayload()), KANOO_FIELDS);
   });
 });
 
@@ -204,21 +233,13 @@ describe("Contact Us", () => {
     const res = await submit({ ...CONTACT_US, ...FRAMER_HONEYPOTS });
 
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(sentPayload(), {
-      name: "Test Person",
-      email: "test@example.com",
-      phone_number: "+966500000000",
-      campaign_name: "",
-      adgroup_name: "",
-      ad_name: "",
-      housing_support_eligible: "",
-      is_saudi_citizen: "",
-      lead_source: "Website",
-      marketing_tags: "Marketing Leads",
-      form_name: "Contact Us",
-      q_1: "Preferred City: Riyadh",
-      q_2: "Looking For: Buy | Property Type: Residential",
-    });
+    assert.equal(
+      kanooCalls[0].init.body,
+      '{"name":"Test Person","email":"test@example.com","phone_number":"+966500000000",' +
+        '"campaign_name":"","form_name":"Contact Us","ad_name":"","adset_name":"","platform":"",' +
+        '"lead_source":"Website","marketing_tags":"Marketing Leads",' +
+        '"q_1":"Preferred City: Riyadh","q_2":"Looking For: Buy | Property Type: Residential"}',
+    );
   });
 
   const emptyAnswerCases = [
@@ -333,7 +354,7 @@ describe("Contact Us detection", () => {
 describe("Kanoo endpoint selection", () => {
   const CAPTURE_URL = "https://capture.example.test/kanoo";
   const KANOO_HEADERS = {
-    Authorization: "Bearer test-token",
+    apikey: "test-token",
     db: "test-db",
     "Content-Type": "application/json",
   };
@@ -750,5 +771,54 @@ describe("Log privacy", () => {
 
     assert.deepEqual(logEntry("validation_failed").missing, ["name"]);
     assertLogsAreClean();
+  });
+});
+
+describe("Kanoo specification contract", () => {
+  for (const [label, body] of [
+    ["Register Your Interest", REGISTER_YOUR_INTEREST],
+    ["Contact Us", CONTACT_US],
+    ["Contact Us with every answer blank", { ...CONTACT_US, "Preferred City": "", "Looking For": "", Location: "" }],
+    ["a submission with unrelated extra keys", { ...REGISTER_YOUR_INTEREST, ...FRAMER_HONEYPOTS, foo: "bar" }],
+  ]) {
+    test(`sends exactly the 12 official fields in order for ${label}`, async () => {
+      await submit(body);
+
+      const payload = sentPayload();
+      assert.deepEqual(Object.keys(payload), KANOO_FIELDS);
+      for (const field of KANOO_FIELDS) assert.equal(typeof payload[field], "string", field);
+    });
+  }
+
+  test("forwards Kanoo's rejection status to the caller", async () => {
+    kanooReply = async () => new Response(JSON.stringify({ message: "rejected" }), { status: 422 });
+
+    const res = await submit(REGISTER_YOUR_INTEREST);
+
+    assert.equal(res.statusCode, 422);
+    assert.equal(res.body.success, false);
+    assert.equal(res.body.message, "Kanoo API rejected the lead");
+  });
+
+  test("returns 502 when Kanoo cannot be reached", async () => {
+    kanooReply = async () => {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+    };
+
+    const res = await submit(REGISTER_YOUR_INTEREST);
+
+    assert.equal(res.statusCode, 502);
+    assert.equal(res.body.message, "Could not reach Kanoo API");
+  });
+
+  test("returns 504 when Kanoo times out", async () => {
+    kanooReply = async () => {
+      throw new DOMException("The operation timed out.", "TimeoutError");
+    };
+
+    const res = await submit(REGISTER_YOUR_INTEREST);
+
+    assert.equal(res.statusCode, 504);
+    assert.equal(res.body.message, "Kanoo API timed out");
   });
 });

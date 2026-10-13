@@ -1,6 +1,6 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
-const PRODUCTION_KANOO_ENDPOINT = "https://pro360api.kanooerp.com/api/zapier/tiktok";
+const PRODUCTION_KANOO_ENDPOINT = "https://pro360api.kanooerp.com/api/zapier/Tiktok";
 const PRODUCTION_KANOO_HOST = new URL(PRODUCTION_KANOO_ENDPOINT).hostname;
 const NON_PRODUCTION_ENVS = ["preview", "development"];
 const KANOO_TIMEOUT_MS = 15000;
@@ -200,17 +200,20 @@ export default async function handler(req, res) {
     return send(400, { success: false, message: "Validation error" });
   }
 
+  // The 12 fields of Kanoo's Lead Submission API, in specification order.
   const payload = {
     name,
     email: pick(body, "email"),
     phone_number: phoneNumber,
     campaign_name: str(body.campaign_name),
-    adgroup_name: str(body.adgroup_name),
+    form_name: str(body.form_name),
     ad_name: str(body.ad_name),
-    housing_support_eligible: str(body.housing_support_eligible),
-    is_saudi_citizen: str(body.is_saudi_citizen),
+    adset_name: str(body.adset_name) || str(body.adgroup_name),
+    platform: str(body.platform),
     lead_source: str(body.lead_source) || "Website",
     marketing_tags: str(body.marketing_tags) || "Marketing Leads",
+    q_1: str(body.q_1),
+    q_2: str(body.q_2),
   };
 
   if (isContactUs(body)) {
@@ -226,7 +229,7 @@ export default async function handler(req, res) {
 
   // Logs never carry submitted values: only which form and fields arrived.
   log("info", requestId, "lead_received", {
-    form_name: payload.form_name ?? null,
+    form_name: payload.form_name || null,
     lead_source: payload.lead_source,
     receivedFields: Object.keys(body),
   });
@@ -238,7 +241,7 @@ export default async function handler(req, res) {
     kanooResponse = await fetch(kanooEndpoint, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${token}`,
+        apikey: token,
         db,
         "Content-Type": "application/json",
       },

@@ -3,7 +3,7 @@
 A small Vercel serverless function that receives Framer form webhooks from the Jewar website and forwards each lead to the Kanoo CRM API. Kanoo credentials live only in Vercel environment variables and are never exposed to the browser.
 
 ```
-Framer form ──(Framer webhook: server-to-server, signed)──▶ POST /api/lead ──▶ https://pro360api.kanooerp.com/api/zapier/tiktok
+Framer form ──(Framer webhook: server-to-server, signed)──▶ POST /api/lead ──▶ https://pro360api.kanooerp.com/api/zapier/Tiktok
 ```
 
 Requirements: Node.js 18 or newer. There are no runtime dependencies; `npm install` only adds the Vercel CLI for `vercel dev`.
@@ -20,7 +20,7 @@ In order, in `api/lead.js`:
 3. `KANOO_TOKEN` and `KANOO_DB` must exist, otherwise `500`.
 4. The endpoint guard picks the downstream URL (see `KANOO_ENDPOINT`), or refuses with `500`.
 5. The body must be a JSON object with a name and a phone number, otherwise `400`.
-6. The Kanoo payload is built and sent with `Authorization: Bearer <KANOO_TOKEN>` and a `db: <KANOO_DB>` header. Kanoo's status is passed back to the caller.
+6. The Kanoo payload is built and sent with the headers from Kanoo's Lead Submission API specification: `apikey: <KANOO_TOKEN>`, `db: <KANOO_DB>` and `Content-Type: application/json`. Kanoo's status is passed back to the caller.
 
 ## Framer webhook signature
 
@@ -49,7 +49,7 @@ Mark the name and phone inputs as required in Framer, because the proxy rejects 
 
 | Name | Where | Purpose |
 | --- | --- | --- |
-| `KANOO_TOKEN` | **Production only** | Real Kanoo bearer token. |
+| `KANOO_TOKEN` | **Production only** | Real Kanoo API key, sent as the `apikey` header. |
 | `KANOO_DB` | **Production only** | Real Kanoo database name. |
 | `FRAMER_WEBHOOK_SECRET` | Production. Optionally a *different* test value for a Preview branch. | The same value as the Framer webhook secret. When set, `POST`s must be signed. |
 | `KANOO_ENDPOINT` | Preview and Development only | A non-production URL, such as a request-capture endpoint you control, that receives the outgoing Kanoo request. It must be `http(s)` and must not be on `pro360api.kanooerp.com`. It is ignored in Production. |
@@ -80,19 +80,24 @@ Framer sends each input's name as a JSON key. For each field, the canonical snak
 
 `name` and `phone_number` are required.
 
+Every lead is sent with exactly the 12 fields of Kanoo's specification, in this order: `name`, `email`, `phone_number`, `campaign_name`, `form_name`, `ad_name`, `adset_name`, `platform`, `lead_source`, `marketing_tags`, `q_1`, `q_2`. All values are strings.
+
+- The fields other than `name`, `email` and `phone_number` are copied from identically named keys when present, otherwise they are `""`.
+- `lead_source` defaults to `Website` and `marketing_tags` to `Marketing Leads`. These defaults are this project's own, not part of Kanoo's specification.
+- `adset_name` also accepts the former `adgroup_name` key.
+- Keys outside the specification are not forwarded.
+
 ### Register Your Interest
 
-The form sends `Name`, `Email` and `phone_number`. Kanoo receives exactly these 10 keys, in this order:
+The form sends `Name`, `Email` and `phone_number`, so Kanoo receives:
 
 ```json
-{"name":"Test Person","email":"test@example.com","phone_number":"+966500000000","campaign_name":"","adgroup_name":"","ad_name":"","housing_support_eligible":"","is_saudi_citizen":"","lead_source":"Website","marketing_tags":"Marketing Leads"}
+{"name":"Test Person","email":"test@example.com","phone_number":"+966500000000","campaign_name":"","form_name":"","ad_name":"","adset_name":"","platform":"","lead_source":"Website","marketing_tags":"Marketing Leads","q_1":"","q_2":""}
 ```
-
-`campaign_name`, `adgroup_name`, `ad_name`, `housing_support_eligible`, `is_saudi_citizen`, `lead_source` and `marketing_tags` are copied from identically named keys when present. Otherwise they are empty, except that `lead_source` defaults to `Website` and `marketing_tags` to `Marketing Leads`.
 
 ### Contact Us
 
-A submission counts as Contact Us when it contains a `Preferred City` or `Looking For` key (or `preferred_city` / `looking_for`). `Location` on its own does not count. Contact Us receives the same 10 keys plus:
+A submission counts as Contact Us when it contains a `Preferred City` or `Looking For` key (or `preferred_city` / `looking_for`). `Location` on its own does not count. For Contact Us, three fields are set by the proxy:
 
 - `form_name`: `"Contact Us"`
 - `q_1`: `"Preferred City: {value}"`
@@ -109,10 +114,15 @@ For example, these live field names with fake values:
 become this Kanoo payload:
 
 ```json
-{"name":"Test Person","email":"test@example.com","phone_number":"+966500000000","campaign_name":"","adgroup_name":"","ad_name":"","housing_support_eligible":"","is_saudi_citizen":"","lead_source":"Website","marketing_tags":"Marketing Leads","form_name":"Contact Us","q_1":"Preferred City: Riyadh","q_2":"Looking For: Buy | Property Type: Residential"}
+{"name":"Test Person","email":"test@example.com","phone_number":"+966500000000","campaign_name":"","form_name":"Contact Us","ad_name":"","adset_name":"","platform":"","lead_source":"Website","marketing_tags":"Marketing Leads","q_1":"Preferred City: Riyadh","q_2":"Looking For: Buy | Property Type: Residential"}
 ```
 
-Kanoo has not yet confirmed that this endpoint accepts `form_name`, `q_1`, `q_2` or the combined `q_2` format.
+### Still to confirm with Kanoo
+
+- Whether empty `campaign_name`, `ad_name`, `adset_name`, `form_name` and `platform` are accepted. The specification only says `q_1` and `q_2` may be empty.
+- Which `platform` value website leads should carry. The proxy sends `""` unless a `platform` key is provided.
+- Whether the combined `q_2` value, two question-and-answer pairs separated by ` | `, is acceptable, since the specification's format is one `{Question}: {Answer}` per field.
+- Whether the `Website` and `Marketing Leads` defaults are the right values.
 
 ## Responses
 
