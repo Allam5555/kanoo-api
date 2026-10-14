@@ -141,12 +141,31 @@ function maskSensitive(text) {
 }
 
 // A privacy-safe, truncated copy of Kanoo's own validation message for diagnostics.
-// Only the top-level string `message` is used (never `data`/echoed bodies), with
-// emails and phone numbers masked. Returns undefined when there is no message to log.
+// Reads known string fields only (top-level `message`/`error` and `data.message`/
+// `data.error`/`data.errors`, or a `data` string); never echoed lead values. Emails and
+// phone numbers are masked and the text is truncated. When no usable message exists it
+// logs `data`'s key names only (never their values); returns undefined otherwise.
 function upstreamDetail(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
-  if (typeof body.message !== "string" || body.message.trim() === "") return undefined;
-  return maskSensitive(body.message).slice(0, 200);
+
+  const parts = [];
+  if (typeof body.message === "string") parts.push(body.message);
+  const data = body.data;
+  if (typeof data === "string") parts.push(data);
+  else if (data && typeof data === "object" && !Array.isArray(data)) {
+    if (typeof data.message === "string") parts.push(data.message);
+    if (typeof data.error === "string") parts.push(data.error);
+    if (Array.isArray(data.errors)) parts.push(data.errors.filter((e) => typeof e === "string").join("; "));
+    else if (typeof data.errors === "string") parts.push(data.errors);
+  }
+  if (typeof body.error === "string") parts.push(body.error);
+
+  const message = parts.map((part) => (part ? part.trim() : "")).find(Boolean);
+  if (message) return maskSensitive(message).slice(0, 200);
+
+  // No usable message: record only the structural key names, never their values.
+  const keys = data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data) : [];
+  return keys.length ? ("data keys: " + keys.join(",")).slice(0, 200) : undefined;
 }
 
 export default async function handler(req, res) {

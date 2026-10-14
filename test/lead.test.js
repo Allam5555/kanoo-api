@@ -804,6 +804,69 @@ describe("Log privacy", () => {
   });
 });
 
+describe("kanoo_failure detail extraction", () => {
+  const find = (event) => logged.find((line) => line.event === event);
+
+  for (const [label, body, expected] of [
+    ["data.message", { status: "error", message: "", data: { message: "platform is required" } }, "platform is required"],
+    ["data.errors array", { message: null, data: { errors: ["q_1 is invalid"] } }, "q_1 is invalid"],
+    ["data.error string", { data: { error: "form_name not allowed" } }, "form_name not allowed"],
+    ["a data string", { data: "Bad Request", message: "" }, "Bad Request"],
+    ["top-level message (unchanged)", { message: "top message", data: { message: "ignored" } }, "top message"],
+  ]) {
+    test(`extracts the message from ${label}`, async () => {
+      kanooReply = async () => new Response(JSON.stringify(body), { status: 400 });
+
+      await submit(REGISTER_YOUR_INTEREST);
+
+      assert.equal(find("kanoo_failure").detail, expected);
+    });
+  }
+
+  test("falls back to data key names (never values) when no message string exists", async () => {
+    kanooReply = async () =>
+      new Response(JSON.stringify({ message: "", data: { code: 422, field: "phone_number" } }), { status: 400 });
+
+    await submit(REGISTER_YOUR_INTEREST);
+
+    assert.equal(find("kanoo_failure").detail, "data keys: code,field");
+    assert.ok(!JSON.stringify(logged).includes("422"), "the value 422 must not be logged");
+  });
+
+  test("masks emails and phone numbers inside a nested message", async () => {
+    kanooReply = async () =>
+      new Response(
+        JSON.stringify({ data: { message: "duplicate lead for test@example.com / +966500000000" } }),
+        { status: 400 },
+      );
+
+    await submit(REGISTER_YOUR_INTEREST);
+
+    assert.equal(find("kanoo_failure").detail, "duplicate lead for [email] / [phone]");
+  });
+
+  test("never logs echoed lead data carried alongside the message", async () => {
+    kanooReply = async () =>
+      new Response(JSON.stringify({ message: "invalid", data: { echo: CONTACT_US } }), { status: 400 });
+
+    await submit(CONTACT_US);
+
+    assert.equal(find("kanoo_failure").detail, "invalid");
+    const output = JSON.stringify(logged);
+    for (const value of ["Test Person", "test@example.com", "+966500000000", "Riyadh", "Residential"]) {
+      assert.ok(!output.includes(value), `log contains ${value}`);
+    }
+  });
+
+  test("truncates a nested message to 200 characters", async () => {
+    kanooReply = async () => new Response(JSON.stringify({ data: { message: "z".repeat(500) } }), { status: 400 });
+
+    await submit(REGISTER_YOUR_INTEREST);
+
+    assert.equal(find("kanoo_failure").detail.length, 200);
+  });
+});
+
 describe("Kanoo specification contract", () => {
   for (const [label, body] of [
     ["Register Your Interest", REGISTER_YOUR_INTEREST],
