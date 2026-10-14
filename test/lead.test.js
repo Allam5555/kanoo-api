@@ -713,17 +713,47 @@ describe("Log privacy", () => {
     assertLogsAreClean();
   });
 
-  test("kanoo_failure records status and category, never Kanoo's response body", async () => {
+  test("kanoo_failure records a sanitized, truncated message and never the echoed body", async () => {
     kanooReply = async () =>
-      new Response(JSON.stringify({ message: "KANOO_DETAIL_MARKER", echo: CONTACT_US }), { status: 422 });
+      new Response(
+        JSON.stringify({
+          status: "error",
+          message: "Lead rejected: contact test@example.com or +966500000000",
+          data: { echo: CONTACT_US },
+        }),
+        { status: 400 },
+      );
 
     await submit(CONTACT_US);
 
     const entry = logEntry("kanoo_failure");
-    assert.equal(entry.status, 422);
+    assert.equal(entry.status, 400);
     assert.equal(entry.category, "upstream_rejected");
-    assert.deepEqual(entry.responseKeys, ["message", "echo"]);
+    assert.deepEqual(entry.responseKeys, ["status", "message", "data"]);
+    // Kanoo's validation message is kept for diagnostics, but emails and phone numbers are masked.
+    assert.equal(entry.detail, "Lead rejected: contact [email] or [phone]");
+    // The echoed lead body (name, city, etc.) is never logged.
     assertLogsAreClean();
+  });
+
+  test("kanoo_failure truncates a long upstream message to 200 characters", async () => {
+    kanooReply = async () =>
+      new Response(JSON.stringify({ message: "x".repeat(500) }), { status: 400 });
+
+    await submit(REGISTER_YOUR_INTEREST);
+
+    assert.equal(logEntry("kanoo_failure").detail.length, 200);
+  });
+
+  test("kanoo_failure omits detail when the upstream body has no message string", async () => {
+    kanooReply = async () =>
+      new Response(JSON.stringify({ status: "error", data: {} }), { status: 400 });
+
+    await submit(REGISTER_YOUR_INTEREST);
+
+    const entry = logEntry("kanoo_failure");
+    assert.equal(entry.detail, undefined);
+    assert.deepEqual(entry.responseKeys, ["status", "data"]);
   });
 
   test("kanoo_failure categorises an upstream server error with a non-JSON body", async () => {

@@ -133,6 +133,22 @@ function log(level, requestId, event, extra = {}) {
   else console.log(line);
 }
 
+// Mask the two kinds of personal data a Kanoo validation message might echo back.
+function maskSensitive(text) {
+  return String(text)
+    .replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[email]")
+    .replace(/\+?\d[\d()\s-]{6,}\d/g, "[phone]");
+}
+
+// A privacy-safe, truncated copy of Kanoo's own validation message for diagnostics.
+// Only the top-level string `message` is used (never `data`/echoed bodies), with
+// emails and phone numbers masked. Returns undefined when there is no message to log.
+function upstreamDetail(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  if (typeof body.message !== "string" || body.message.trim() === "") return undefined;
+  return maskSensitive(body.message).slice(0, 200);
+}
+
 export default async function handler(req, res) {
   const requestId = randomUUID();
   res.setHeader("X-Request-Id", requestId);
@@ -279,6 +295,7 @@ export default async function handler(req, res) {
         kanooBody && typeof kanooBody === "object" && !Array.isArray(kanooBody)
           ? Object.keys(kanooBody)
           : undefined,
+      detail: upstreamDetail(kanooBody),
     });
     return send(kanooResponse.status, {
       success: false,
